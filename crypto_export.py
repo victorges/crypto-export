@@ -32,9 +32,10 @@
 #
 # Fix for winrandom problem with WinPython 3.5 64bit: https://stackoverflow.com/a/39478958/2863900
 
-import argparse, configparser, os, sys, re, json, itertools
-import pprint
-from datetime import date, datetime
+import argparse, configparser, os, sys, re, json, itertools, pprint
+from decimal import Decimal
+from datetime import datetime
+from typing import Optional
 
 supported_exchanges = ['coinbase', 'coinbase-pro', 'novadax']
 
@@ -400,6 +401,22 @@ if 'coinbase-pro' in queued_exchanges:
         for row in sorted(cbp_entries, key=lambda row: row[0]):
             outfile.write('%s\n' % ','.join(['%s' % x for x in row]))
 
+class Transaction:
+    def __init__(self, id: str, timestamp: datetime) -> None:
+        self.id = id
+        self.timestamp = timestamp
+
+    sent_amount: Optional[Decimal] = None
+    sent_currency: Optional[str] = None
+    recv_amount: Optional[Decimal] = None
+    recv_currency: Optional[str] = None
+    fee_amount: Optional[Decimal] = None
+    fee_currency: Optional[str] = None
+
+    type: Optional[str] = None
+    comment: Optional[str] = None
+    exchange: Optional[str] = None
+
 # NovaDAX EXPORT
 if 'novadax' in queued_exchanges:
     from novadax import RequestClient as NovaClient
@@ -438,15 +455,15 @@ if 'novadax' in queued_exchanges:
         last_id = None
         for i in itertools.count(1):
             print("Requesting page #%d of NovaDAX wallet history" % i)
-            page = nova_client._client.get_with_auth('/v1/wallet/query/deposit-withdraw', {
+            wpage: list = nova_client._client.get_with_auth('/v1/wallet/query/deposit-withdraw', {
                 'size': page_size,
                 'start': last_id
             })['data']
 
-            nova_wallet_hist += page if len(page) == 0 or page[0]['id'] != last_id else page[1:]
-            if len(page) < page_size:
+            nova_wallet_hist += wpage if len(wpage) == 0 or wpage[0]['id'] != last_id else wpage[1:]
+            if len(wpage) < page_size:
                 break
-            last_id = page[-1]['id']
+            last_id = wpage[-1]['id']
 
         print("Storing wallet history in", nova_wallet_filename)
         with open(nova_wallet_filename, 'w') as outfile:
@@ -465,39 +482,38 @@ if 'novadax' in queued_exchanges:
         last_id = None
         for i in itertools.count(1):
             print("Requesting page #%d of NovaDAX fills" % i)
-            page = nova_client.list_order_fills(limit=page_size, to_id=last_id)['data']
+            fpage: list = nova_client.list_order_fills(limit=page_size, to_id=last_id)['data']
 
-            nova_fills += page
-            if len(page) < page_size:
+            nova_fills += fpage
+            if len(fpage) < page_size:
                 break
-            last_id = page[-1]['id']
+            last_id = fpage[-1]['id']
 
         print("Storing total (%d) fill history in %s" % (len(nova_fills), nova_fills_filename))
         with open(nova_fills_filename, 'w') as outfile:
             json.dump(nova_fills, outfile)
 
-    nova_entries = []
+    nova_entries: list[Transaction] = []
     for fill in nova_fills:
-        timestamp = datetime.utcfromtimestamp(float(fill['timestamp']) / 1000).strftime('%m/%d/%Y %H:%M:%S')
-        trade_id = '%s-%s' % (fill['id'], fill['orderId'])
-        fee, fee_cur = fill['feeAmount'], fill['feeCurrency']
+        tx = Transaction('%s-%s' % (fill['id'], fill['orderId']), datetime.utcfromtimestamp(float(fill['timestamp']) / 1000))
+        tx.comment = 'Role: ' + fill['role']
+        tx.type = 'trade'
+        tx.exchange = 'NovaDAX'
 
-        row = [timestamp, 0, 'ABC', 0, 'XYZ', fee, fee_cur, trade_id, 'Role: ' + fill['role'], 'trade', 'NovaDAX']
+        tx.fee_amount, tx.fee_currency = fee, fee_cur = Decimal(fill['feeAmount']), fill['feeCurrency']
 
         base_cur, quote_cur = fill['symbol'].split('_')
-        fee, base_amount, price = float(fee), float(fill['amount']), float(fill['price'])
+        base_amount, price = Decimal(fill['amount']), Decimal(fill['price'])
         quote_amount = base_amount * price
 
         if fill['side'] == 'BUY':
-            sent_cur, sent_amount = quote_cur, quote_amount + (fee if fee_cur == quote_cur else 0)
-            recv_cur, recv_amount = base_cur, base_amount - (fee if fee_cur == base_cur else 0)
+            tx.sent_currency, tx.sent_amount = quote_cur, quote_amount + (fee if fee_cur == quote_cur else 0)
+            tx.recv_currency, tx.recv_amount = base_cur, base_amount - (fee if fee_cur == base_cur else 0)
         else:
-            sent_cur, sent_amount = base_cur, base_amount + (fee if fee_cur == base_cur else 0)
-            recv_cur, recv_amount = quote_cur, quote_amount - (fee if fee_cur == quote_cur else 0)
+            tx.sent_currency, tx.sent_amount = base_cur, base_amount + (fee if fee_cur == base_cur else 0)
+            tx.recv_currency, tx.recv_amount = quote_cur, quote_amount - (fee if fee_cur == quote_cur else 0)
 
-        row[1:5] = '%0.16f' % recv_amount, recv_cur, '%0.16f' % sent_amount, sent_cur
-
-        nova_entries.append(row)
+        nova_entries.append(tx)
         # pprint.pprint(fill)
         # print(','.join('%s' % x for x in row))
 
@@ -505,33 +521,35 @@ if 'novadax' in queued_exchanges:
     print("- Processed %d order fills in NovaDAX account" % nova_fills_count)
 
     withdrawal_fee = {
-        'BTC': 0.0004,
-        'ETH': 0.008,
-        'BCH': 0.0001,
-        'XMR': 0.01
+        'BTC': Decimal('0.0004'),
+        'ETH': Decimal('0.008'),
+        'BCH': Decimal('0.0001'),
+        'XMR': Decimal('0.01')
     }
     for transfer in nova_wallet_hist:
-        timestamp = datetime.utcfromtimestamp(float(transfer['createdAt']) / 1000).strftime('%m/%d/%Y %H:%M:%S')
+        tx = Transaction(transfer['id'], datetime.utcfromtimestamp(float(transfer['createdAt']) / 1000))
+
         currency = transfer['currency']
-        row = [timestamp, 0, currency, 0, currency, 0, currency, transfer['id'], 'TX Hash: ' + transfer['txHash'], 'transfer', 'NovaDAX']
+        tx.comment = 'TX Hash: ' + transfer['txHash']
+        tx.exchange = 'NovaDAX'
 
         if transfer['state'] != 'SUCCESS':
             continue
 
         ttype = transfer['type']
-        amount = transfer['amount']
+        amount = Decimal('%.16f' % transfer['amount'])
         if ttype == 'COIN_IN':
-            row[9] = 'deposit'
-            row[1:3] = amount, currency
+            tx.type = 'deposit'
+            tx.recv_amount, tx.recv_currency = amount, currency
         elif ttype == 'COIN_OUT':
-            row[9] = 'withdrawal'
-            row[3:5] = amount, currency
-            row[5:7] = withdrawal_fee[currency], currency
+            tx.type = 'withdrawal'
+            tx.sent_amount, tx.sent_currency = amount, currency
+            tx.fee_amount, tx.fee_currency = withdrawal_fee[currency], currency
         else:
             # Unknown type
             continue
 
-        nova_entries.append(row)
+        nova_entries.append(tx)
         # pprint.pprint(transfer)
         # print(','.join('%s' % x for x in row))
 
@@ -539,8 +557,20 @@ if 'novadax' in queued_exchanges:
     print("- Processed %d transfers in NovaDAX account" % nova_transfers_count)
     print("- Total of %d records obtained from NovaDAX" % len(nova_entries))
 
+    first_not_none = lambda arr, dft: next((v for v in arr if v is not None), dft)
+    or_zero = lambda *args: first_not_none(args, 0)
+    or_empty = lambda *args: first_not_none(args, '')
+
     nova_txs_filename = '%snova_transactions.csv' % file_prefix
     with open(nova_txs_filename, 'w') as outfile:
         outfile.write('Trade date,Buy amount,Buy currency,Sell amount,Sell currency,Fee amount,Fee currency,Trade ID,Comment,Type\n')
-        for row in sorted(nova_entries, key=lambda row: row[0]):
+        for tx in sorted(nova_entries, key=lambda tx: tx.timestamp):
+            fallback_cur = or_empty(tx.sent_currency, tx.recv_currency, tx.fee_currency)
+            row = [
+                tx.timestamp.strftime('%m/%d/%Y %H:%M:%S'),
+                or_zero(tx.recv_amount), or_empty(tx.recv_currency, fallback_cur),
+                or_zero(tx.sent_amount), or_empty(tx.sent_currency, fallback_cur),
+                or_zero(tx.fee_amount), or_empty(tx.fee_currency, fallback_cur),
+                tx.id, or_empty(tx.comment), or_empty(tx.type), or_empty(tx.exchange)
+            ]
             outfile.write('%s\n' % ','.join(['%s' % x for x in row]))
